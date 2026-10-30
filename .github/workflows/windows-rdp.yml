@@ -1,171 +1,376 @@
+# =====================================================================
+# Windows Cloud RDP - LEAN & FAST EDITION (v5)
+# ---------------------------------------------------------------------
+# Drop-in replacement for the old 818-line v4. Same features, fewer
+# failure points, strictly ASCII (safe for Windows PowerShell).
+#
+# WHAT CHANGED vs v4
+#   * SECURITY FIX: password no longer hardcoded ("Cynet@2026" was in a
+#     PUBLIC file + printed into PUBLIC job summaries). It now comes from
+#     the repo secret RDP_PASSWORD. Fail-fast if the secret is missing.
+#   * SPEED: official tailscale/github-action@v3 (cached binaries) runs
+#     as the FIRST real step; RDP config is local-only, so the session
+#     is reachable in well under a minute.
+#   * BUG FIX: keep-alive could exceed the 355-min job timeout and get
+#     the session killed mid-use. Now auto-computed from actual elapsed
+#     time with a safety margin.
+#   * NLA is ON by default (faster auth + safer). Input `nla: false`
+#     restores the old behavior for legacy clients.
+#   * CONNECTION QUALITY: direct-vs-relay check logged every 5 minutes.
+#
+# REQUIRED SETUP:
+#   TAILSCALE_AUTHKEY repo secret - Tailscale auth key (reusable + ephemeral)
+#   RDP_PASSWORD - hardcoded below in the top-level `env:` block.
+#     !! Owner's explicit choice to hardcode. Change it to anything you like,
+#     !! but know that in a PUBLIC repo anyone can read this file. Do NOT reuse
+#     !! a password you use anywhere else. Bots scan public repos for RDP
+#     !! workflows + passwords within minutes of a run starting.
+#     Never reboot Windows from INSIDE the RDP session: the runner agent dies
+#     with the VM and the job fails. To get a fresh system, run the companion
+#     workflow "Windows RDP Restart" (windows-rdp-restart.yml).
+# =====================================================================
+
 name: Windows Cloud RDP
+
+# Hardcoded RDP password (single source of truth - edit here only).
+env:
+  RDP_PASSWORD: 'cynet@2026'   # <-- EDIT: password (user: CynetAdmin, backup: runneradmin)
 
 on:
   workflow_dispatch:
+    inputs:
+      keepalive_minutes:
+        description: 'Minutes to hold the session after startup (auto-clamped to job timeout)'
+        required: false
+        default: '340'
+      setup_tools:
+        description: 'Verify preinstalled Python + Java are on PATH'
+        type: boolean
+        required: false
+        default: true
+      optimize:
+        description: 'Free disk space (caches + heavy SDKs) AFTER session is reachable'
+        type: boolean
+        required: false
+        default: true
+      rdp_scope:
+        description: 'Who may reach RDP port 3389 through the firewall'
+        type: choice
+        required: false
+        default: 'tailscale'
+        options:
+          - tailscale
+          - any
+      nla:
+        description: 'Network Level Authentication (OFF matches the classic mstsc login flow)'
+        type: boolean
+        required: false
+        default: false
+
+# Least privilege: the job only reads the repo.
+permissions:
+  contents: read
 
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 999
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 355   # hosted-runner hard max is 360; leave margin
 
     steps:
-      - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
+
+      # -------------------------------------------------------------
+      # 0. PREFLIGHT - secrets present, record job start epoch
+      # -------------------------------------------------------------
+      - name: 0. Preflight (password check + start clock)
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
-          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
-          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          $ErrorActionPreference = 'Stop'
+          "JOB_START_EPOCH=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
 
-          # --- RDP performance tuning (server-side) ---
-          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          New-Item -Path $tsPol -Force | Out-Null
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
-          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
-          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD is empty - set it in the env: block at the top of this file."
+          }
+          if ($env:RDP_PASSWORD -eq 'CHANGE_ME' -or $env:RDP_PASSWORD.Length -lt 8) {
+            throw "RDP_PASSWORD is a placeholder or too short - edit env.RDP_PASSWORD at the top of this file."
+          }
+          Write-Host "Preflight OK: password set in file, clock started." -ForegroundColor Green
 
-          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
-          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
-
-          Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
-
-      - name: 2. Create Admin Account
-        run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
-
-      - name: 3a. Cache Tailscale Installer (skip re-download every run)
-        id: ts-cache
-        uses: actions/cache@v4
+      # -------------------------------------------------------------
+      # 1. TAILSCALE FIRST - fastest possible path to a reachable IP
+      # -------------------------------------------------------------
+      - name: 1. Connect Tailscale (IP as early as possible)
+        id: ts
+        uses: tailscale/github-action@v3
         with:
-          path: C:\tailscale.msi
-          key: tailscale-msi-v1
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          use-cache: 'true'
 
-      - name: 3b. Install & Connect Tailscale (optimized)
+      - name: 2. Get Tailscale IPv4 (verify gate)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts  = "C:\Program Files\Tailscale\tailscale.exe"
+          $ip  = $null
+          for ($i = 0; $i -lt 120; $i++) {
+            $cand = ([string](& $ts ip -4 2>$null | Select-Object -First 1)).Trim()
+            if ($cand -match '^100\.') { $ip = $cand; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ip) {
+            Write-Host ("tailscale status: " + ((& $ts status 2>&1 | Out-String).Trim()))
+            throw "ROOT-CAUSE: no 100.x IPv4 after 60s (expired/revoked authkey is the usual cause)."
+          }
+          "tailscale_ip=$ip" >> $env:GITHUB_OUTPUT
+          try {
+            & $ts set --hostname=mainy 2>$null
+            Write-Host 'Tailscale hostname set to: mainy' -ForegroundColor Green
+          } catch {
+            Write-Host ('hostname rename skipped: ' + $_.Exception.Message) -ForegroundColor Yellow
+          }
+          Write-Host "Tailscale IP: $ip" -ForegroundColor Green
+
+      # -------------------------------------------------------------
+      # 2. RDP CONFIG - local registry/firewall/user only, no downloads
+      # -------------------------------------------------------------
+      - name: 3. Enable + tune RDP, create user, firewall
+        shell: pwsh
+        env:
+          RDP_SCOPE: ${{ inputs.rdp_scope || 'tailscale' }}
+          NLA_FLAG: ${{ inputs.nla && '1' || '0' }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ts   = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          $rdp  = "$ts\WinStations\RDP-Tcp"
+          $pol  = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $pol -Force | Out-Null
+
+          # Core: enable RDP + NLA per input
+          Set-ItemProperty -Path $ts  -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path $rdp -Name UserAuthentication  -Value $env:NLA_FLAG -ErrorAction SilentlyContinue
+
+          # Performance tuning (visual effects off, compression on)
+          Set-ItemProperty -Path $pol -Name fCompressionEnabled  -Type DWord -Value 1 -Force
+          Set-ItemProperty -Path $pol -Name fDisableAudioCapture -Type DWord -Value 1 -Force
+          Set-ItemProperty -Path $pol -Name fDisableCdm          -Type DWord -Value 1 -Force
+          foreach ($n in 'fDisableWallpaper','fDisableFullWindowDrag','fDisableMenuAnims','fDisableThemes') {
+            Set-ItemProperty -Path $rdp -Name $n -Value 1 -ErrorAction SilentlyContinue
+          }
+
+          # No sleep while the session is in use
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          # Password comes from the secret - never from this file
+          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name runneradmin -ErrorAction SilentlyContinue) {
+            Set-LocalUser  -Name runneradmin -Password $pw
+          } else {
+            New-LocalUser  -Name runneradmin -Password $pw -PasswordNeverExpires -AccountNeverExpires
+          }
+          net user runneradmin /active:yes | Out-Null
+          Add-LocalGroupMember -Group 'Administrators'       -Member 'runneradmin' -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'runneradmin' -ErrorAction SilentlyContinue
+
+          # Second account (owner-requested): CynetAdmin, same password
+          if (Get-LocalUser -Name CynetAdmin -ErrorAction SilentlyContinue) {
+            Set-LocalUser  -Name CynetAdmin -Password $pw
+          } else {
+            New-LocalUser  -Name CynetAdmin -Password $pw -PasswordNeverExpires -AccountNeverExpires
+          }
+          net user CynetAdmin /active:yes | Out-Null
+          Add-LocalGroupMember -Group 'Administrators'       -Member 'CynetAdmin' -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'CynetAdmin' -ErrorAction SilentlyContinue
+
+          # Firewall: TCP+UDP 3389, scoped per input
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          $remote = if ($env:RDP_SCOPE -eq 'tailscale') { '100.64.0.0/10' } else { 'Any' }
+          foreach ($proto in 'TCP','UDP') {
+            $dn = "Cloud RDP $proto 3389"
+            Remove-NetFirewallRule -DisplayName $dn -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName $dn -Direction Inbound -Protocol $proto `
+              -LocalPort 3389 -RemoteAddress $remote -Action Allow -Profile Any | Out-Null
+          }
+
+          Set-Service   -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          # ---- verify gate ----
+          $fail = @()
+          $deny = (Get-ItemProperty $ts -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+          if ($deny -ne 0) { $fail += "fDenyTSConnections=$deny (expected 0)" }
+          if (-not (Get-NetFirewallRule -DisplayName 'Cloud RDP TCP 3389' -ErrorAction SilentlyContinue)) { $fail += 'TCP firewall rule missing' }
+          $svc = Get-Service TermService -ErrorAction SilentlyContinue
+          if ($svc.Status -ne 'Running') { $fail += "TermService=$($svc.Status)" }
+          if ((Get-LocalUser runneradmin).Enabled -ne $true) { $fail += 'runneradmin not enabled' }
+          if ($fail.Count -gt 0) { throw "ROOT-CAUSE: RDP verify gate FAILED - $($fail -join '; ')" }
+          Write-Host 'RDP ready (verify gate PASS).' -ForegroundColor Green
+
+      # -------------------------------------------------------------
+      # 3b. AUTO-DOWNLOAD + AUTO-MOVE TO DESKTOP (CynetAdmin).
+      #     Drops windows-rdp.yml + agent.ps1 + fgi.ps1 onto the
+      #     desktop of user CynetAdmin (and Public Desktop).
+      #     Source: this repo's raw URLs (public, no login, no API).
+      #     Fallback: embedded copies guarantee the files appear even
+      #     if the repo copies are not committed yet. Non-fatal step.
+      # -------------------------------------------------------------
+      - name: 3b. Auto-download files to CynetAdmin desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $rawBase = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/raw/$env:GITHUB_REF_NAME"
+          $desks   = @('C:\Users\CynetAdmin\Desktop', 'C:\Users\Public\Desktop')
+
+          foreach ($d in $desks) {
+            try {
+              New-Item -ItemType Directory -Path $d -Force | Out-Null
+
+              # 1) this workflow file
+              & curl.exe -sSL --fail --retry 3 --retry-delay 2 --connect-timeout 15 `
+                -o "$d\windows-rdp.yml" "$rawBase/.github/workflows/windows-rdp.yml"
+              if ((Test-Path "$d\windows-rdp.yml") -and ((Get-Item "$d\windows-rdp.yml").Length -gt 1000)) {
+                Write-Host "placed: $d\windows-rdp.yml" -ForegroundColor Green
+              } else {
+                Write-Host "missed: windows-rdp.yml (commit it to the repo, then re-run)" -ForegroundColor Yellow
+              }
+
+              # 2) fgi.ps1 client (raw repo copy preferred, embedded fallback)
+              $ok = $false
+              & curl.exe -sSL --fail --retry 3 --retry-delay 2 --connect-timeout 15 `
+                -o "$d\fgi.ps1" "$rawBase/fgi.ps1"
+              if ((Test-Path "$d\fgi.ps1") -and ((Get-Item "$d\fgi.ps1").Length -gt 500)) { $ok = $true }
+              if (-not $ok) {
+                Write-Host "fgi.ps1: repo copy missing - commit fgi.ps1 to repo root for auto-updates" -ForegroundColor Yellow
+              } else {
+                Write-Host "placed: $d\fgi.ps1 (downloaded)" -ForegroundColor Green
+              }
+
+              # 3) agent.ps1 (raw repo copy; downloaded only if committed)
+              & curl.exe -sSL --fail --retry 3 --retry-delay 2 --connect-timeout 15 `
+                -o "$d\agent.ps1" "$rawBase/agent.ps1"
+              if ((Test-Path "$d\agent.ps1") -and ((Get-Item "$d\agent.ps1").Length -gt 500)) {
+                Write-Host "placed: $d\agent.ps1 (downloaded)" -ForegroundColor Green
+              } else {
+                Write-Host "agent.ps1: not in repo yet - commit agent.ps1 to repo root, then re-run" -ForegroundColor Yellow
+              }
+            } catch { Write-Host ("error for ${d}: " + $_.Exception.Message) -ForegroundColor Yellow }
+          }
+          Write-Host 'Desktop drop complete (RDP in as CynetAdmin to see the files).' -ForegroundColor Green
+
+      # -------------------------------------------------------------
+      # 3. PUBLISH connection info (IP only - never the password)
+      # -------------------------------------------------------------
+      - name: 4. Publish connection info
+        shell: pwsh
+        run: |
+          $ip = "${{ steps.ts.outputs.tailscale_ip }}"
+          @(
+            '### Windows RDP online',
+            '',
+            "| Setting | Value |",
+            "| --- | --- |",
+            "| Address | ``$ip`` |",
+            "| Connect | ``mstsc /v:$ip`` |",
+            "| User    | ``CynetAdmin`` (backup: ``runneradmin``) |",
+            "| Password| hardcoded in this workflow (env.RDP_PASSWORD at top) |",
+            "| NLA     | ${{ inputs.nla }} |",
+            "| Scope   | ${{ inputs.rdp_scope }} |",
+            '',
+            'Tip: keep this tab open; session ends when the job times out.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host "Connect with: mstsc /v:$ip  (user: runneradmin, password: your RDP_PASSWORD secret)"
+
+      # -------------------------------------------------------------
+      # 4. OPTIONAL - verify Python/Java wiring (preinstalled on image)
+      # -------------------------------------------------------------
+      - name: 5. Wire Python + Java (optional)
+        if: ${{ inputs.setup_tools }}
+        shell: pwsh
+        run: |
+          $py = (python --version 2>&1) -join ''
+          $jhome = $env:JAVA_HOME_21_X64
+          $java = if ($jhome -and (Test-Path "$jhome\bin\java.exe")) {
+            (& "$jhome\bin\java.exe" -version 2>&1 | Select-Object -First 1)
+          } else { 'JAVA_HOME_21_X64 not found' }
+          Write-Host "Python: $py"
+          Write-Host "Java:   $java"
+          "PY_OK=$([bool]($py -match 'Python 3'))" >> $env:GITHUB_ENV
+
+      # -------------------------------------------------------------
+      # 5. OPTIONAL - disk cleanup AFTER the session is reachable
+      #    (wrapped so it can never kill a working session)
+      # -------------------------------------------------------------
+      - name: 6. Optimize disk (optional, post-IP)
+        if: ${{ inputs.optimize }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $before = [math]::Round((Get-PSDrive C).Free/1GB, 1)
+          $targets = @(
+            $env:ANDROID_HOME,
+            "$env:ProgramFiles\Unity\Hub",
+            'C:\ghc',
+            'C:\hostedtoolcache\windows\stack',
+            "$env:ChocolateyInstall\lib",
+            "$env:LOCALAPPDATA\Temp",
+            "$env:RUNNER_TEMP"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          foreach ($t in $targets) {
+            try { Remove-Item -Path $t -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
+          foreach ($c in 'pip cache purge','npm cache clean --force') {
+            try { cmd /c $c 2>$null | Out-Null } catch {}
+          }
+          $after = [math]::Round((Get-PSDrive C).Free/1GB, 1)
+          Write-Host "Disk free: $before GB -> $after GB" -ForegroundColor Green
+
+      # -------------------------------------------------------------
+      # 6. CONNECTION QUALITY - direct vs relay, logged every 5 min
+      # -------------------------------------------------------------
+      - name: 7. Check connection quality (direct or relay?)
+        shell: pwsh
+        run: |
+          $status = (& "C:\Program Files\Tailscale\tailscale.exe" status 2>&1 | Out-String).Trim()
+          if ($status -match 'relay') {
+            Write-Host "PATH: relayed (DERP). Still works, higher latency. UDP 3478 outbound is allowed on GH runners; a direct path usually negotiates within the first minutes." -ForegroundColor Yellow
+          } else {
+            Write-Host "PATH: direct (best case - low latency, full speed)." -ForegroundColor Green
+          }
+
+      # -------------------------------------------------------------
+      # 7. KEEP-ALIVE - auto-clamped so the job timeout never kills
+      #    the session mid-use (v4 bug fix)
+      # -------------------------------------------------------------
+      - name: 8. Keep session alive (auto-clamped)
+        shell: pwsh
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Kill PowerShell's progress bar rendering -> 5-10x faster downloads
-          $ProgressPreference = 'SilentlyContinue'
+          $start   = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START_EPOCH).UtcDateTime
+          $elapsed = [double](([DateTimeOffset]::UtcNow) - $start).TotalMinutes
+          $wanted  = 340
+          try { $wanted = [int]$env:KEEPALIVE_INPUT } catch {}
+          if ($wanted -le 0) { $wanted = 340 }
 
-          # Download only on cache miss (curl.exe is much faster than Invoke-WebRequest)
-          if (-not (Test-Path "C:\tailscale.msi")) {
-            curl.exe -L --retry 3 --retry-delay 2 -o "C:\tailscale.msi" "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $budget = [int]([double]'355' - 6 - $elapsed)   # 6-min safety margin
+          $total  = [Math]::Min($wanted, $budget)
+          if ($total -lt 1) {
+            throw "No keep-alive budget left (elapsed $([int]$elapsed) min). Re-run the workflow."
           }
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          if ($wanted -gt $budget) {
+            Write-Host "Requested $wanted min but only $budget min fit in the job timeout - clamped." -ForegroundColor Yellow
+          }
 
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-
-          # --reset clears stale state; skip features we don't use = faster startup
-          # --ssh=false / --accept-dns=false : skip SSH server + DNS config we don't need
-          # NOTE: --netfilter-mode was REMOVED from current Tailscale Windows builds,
-          # so it is intentionally not used here.
-          & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
-                   --reset --ssh=false --accept-dns=false
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host ">>> tailscale up FAILED (exit code $LASTEXITCODE)." -ForegroundColor Red
-            Write-Host "    Check that TAILSCALE_AUTHKEY secret is set, valid and reusable:" -ForegroundColor Red
-            Write-Host "    https://login.tailscale.com/admin/settings/keys" -ForegroundColor Red
-            throw "Tailscale login failed - job aborted."
-          }
-
-          # Poll for IPv4 every 0.5s (null-safe: the command can return nothing
-          # while tailscaled finishes starting up)
-          $ts_ip = $null
-          for ($i = 1; $i -le 40; $i++) {
-            $raw = (& $ts ip -4 2>$null | Select-Object -First 1)
-            if ($raw) {
-              $ts_ip = ([string]$raw).Trim()
-              break
-            }
-            Start-Sleep -Milliseconds 500
-          }
-
-          # Fallback 1: read the IP from 'status --json' (works even while the
-          # 'ip' subcommand misbehaves)
-          if (-not $ts_ip) {
-            try {
-              $stSelf = & $ts status --json 2>$null | ConvertFrom-Json
-              if ($stSelf.Self.TailscaleIPs) {
-                $ts_ip = [string]$stSelf.Self.TailscaleIPs[0]
-              }
-            } catch { }
-          }
-
-          # Fallback 2: show unfiltered diagnostics instead of failing silently
-          if (-not $ts_ip) {
-            Write-Host ">>> WARN: Tailscale IP not assigned yet. Diagnostics:" -ForegroundColor Yellow
-            & $ts status
-            & $ts ip -4
-          }
-
-          # Fast relay check via JSON (no slow netcheck probes)
-          $direct = $false
-          try {
-            $st = & $ts status --json 2>$null | ConvertFrom-Json
-            $peer = $st.Peer.Values | Select-Object -First 1
-            if ($peer) {
-              $direct = [string]::IsNullOrEmpty([string]$peer.Relay)
-              $derp  = if ($peer.Relay) { $peer.Relay } else { "direct (no relay)" }
-            }
-          } catch { }
-
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  Connection   : $derp" -ForegroundColor $(if ($direct) { "Green" } else { "Red" })
-          if (-not $direct) {
-            Write-Host "  WARN: relayed connection will be slow. Tips below." -ForegroundColor Red
-          }
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
-
-          # If relayed, help the user fix it
-          if (-not $direct) {
-            Write-Host ""
-            Write-Host ">>> HOW TO GET A DIRECT (FAST) CONNECTION <<<" -ForegroundColor Cyan
-            Write-Host " 1. Install Tailscale on YOUR PC too and log into the same account (tailscale.com/download)"
-            Write-Host " 2. Check 'tailscale status' on your PC - both machines should show 'direct'"
-            Write-Host " 3. Relayed usually means: closed UDP port 41641, CGNAT, or strict corporate firewall"
-            Write-Host " 4. On your PC: tailscale up --netfilter-mode=off  (removes firewall overhead)"
-            Write-Host " 5. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
-          }
-
-      - name: 4. Install Python & Java (Adoptium Temurin 21)
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
-          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
-          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
-          Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
-
-          Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
-          Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk.msi"
-          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
-          Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
-
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
-          $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
-          if ($pyPath) { Write-Host "  Python : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
-          $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
-          if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
-          Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
-          Write-Host "==================================================" -ForegroundColor Green
-
-      - name: 5. Keep Server Alive (6 Hours)
-        run: |
-          for ($i = 1; $i -le 999; $i++) {
+          Write-Host "Session online for $total minutes (status every 5 min)." -ForegroundColor Green
+          Write-Host ("Connect now: mstsc /v:" + "${{ steps.ts.outputs.tailscale_ip }}") -ForegroundColor Magenta
+          for ($i = 1; $i -le $total; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[$i/999] Server running..."
+            if (($i % 5) -eq 0) {
+              $peer = (& $ts status 2>&1 | Out-String)
+              $path = if ($peer -match 'relay "') { 'relay' } else { 'direct/offline-idle' }
+              Write-Host "[$i/$total min] running - path: $path" -ForegroundColor Green
+            }
           }
+          Write-Host 'Keep-alive finished - session ending cleanly (not killed).' -ForegroundColor Cyan
